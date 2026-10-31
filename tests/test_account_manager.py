@@ -105,6 +105,81 @@ class SecureCliTests(unittest.TestCase):
         self.assertEqual(self.events()[-1]['home'], str(second))
         self.assertFalse(any(self.cxa_home.rglob('auth.json')))
 
+    def test_switch_without_name_rotates_in_registration_order_and_wraps(self):
+        self.cmd('init')
+        # These are intentionally not in alphabetical order.
+        for name in ('zeta', 'alpha', 'beta'):
+            self.cmd('add', name)
+        self.assertEqual(self.cmd('list').stdout.splitlines(), ['  zeta', '  alpha', '* beta'])
+        self.cmd('switch', 'zeta')
+        for expected in ('alpha', 'beta', 'zeta', 'alpha'):
+            self.assertIn(f'Active account: {expected}', self.cmd('switch').stdout)
+            self.assertEqual(json.loads((self.cxa_home / 'active.json').read_text())['active'], expected)
+            self.cmd('run')
+            self.assertEqual(self.events()[-1]['home'], str(self.cxa_home / 'accounts' / expected))
+        self.assertEqual(json.loads((self.cxa_home / 'account-order.json').read_text()),
+                         ['zeta', 'alpha', 'beta'])
+
+    def test_switch_no_name_with_resume_uses_next_profile(self):
+        self.cmd('init')
+        self.cmd('import-current', 'original')
+        self.cmd('add', 'second')
+        self.cmd('switch', 'original')
+        result = self.cmd('switch', '--resume')
+        self.assertIn('Active account: second', result.stdout)
+        self.assertEqual(self.events()[-1]['cmd'], ['resume', '--last'])
+        self.assertEqual(self.events()[-1]['home'], str(self.cxa_home / 'accounts/second'))
+        self.cmd('switch', '--resume')
+        self.assertEqual(self.events()[-1]['home'], str(self.codex_home))
+
+    def test_switch_no_name_requires_at_least_two_accounts(self):
+        self.cmd('init')
+        fail = self.cmd('switch', success=False)
+        self.assertIn('at least two', fail.stderr)
+        self.cmd('add', 'only')
+        fail = self.cmd('switch', success=False)
+        self.assertIn('at least two', fail.stderr)
+        self.assertEqual(json.loads((self.cxa_home / 'active.json').read_text())['active'], 'only')
+
+    def test_switch_no_name_after_removal_and_no_active(self):
+        self.cmd('init')
+        for name in ('zeta', 'alpha', 'beta'):
+            self.cmd('add', name)
+        self.cmd('remove', 'beta')  # Last registered account was active.
+        self.assertEqual(json.loads((self.cxa_home / 'active.json').read_text()), {'active': None})
+        self.assertIn('Active account: zeta', self.cmd('switch').stdout)
+        self.assertIn('Active account: alpha', self.cmd('switch').stdout)
+        self.cmd('remove', 'zeta')
+        self.cmd('add', 'gamma')
+        # Newly registered account is appended even when its name sorts earlier.
+        self.assertEqual(json.loads((self.cxa_home / 'account-order.json').read_text()),
+                         ['alpha', 'gamma'])
+        self.cmd('switch', 'alpha')
+        self.assertIn('Active account: gamma', self.cmd('switch').stdout)
+
+    def test_switch_no_name_does_not_select_unsafe_auth(self):
+        self.cmd('init')
+        self.cmd('add', 'first')
+        self.cmd('add', 'second')
+        self.cmd('switch', 'first')
+        (self.cxa_home / 'accounts/second/auth.json').write_text('unexpected')
+        self.assertNotEqual(self.cmd('switch', success=False).returncode, 0)
+        self.assertEqual(json.loads((self.cxa_home / 'active.json').read_text())['active'], 'first')
+
+    def test_preexisting_accounts_without_order_file_are_supported(self):
+        self.cmd('init')
+        for name in ('zeta', 'alpha'):
+            self.cmd('add', name)
+        # Earlier CLI releases did not have order metadata.
+        (self.cxa_home / 'account-order.json').unlink()
+        self.cmd('switch', 'alpha')
+        self.assertIn('Active account: zeta', self.cmd('switch').stdout)
+        self.cmd('add', 'beta')
+        self.assertEqual(json.loads((self.cxa_home / 'account-order.json').read_text()),
+                         ['alpha', 'zeta', 'beta'])
+        self.cmd('switch', 'zeta')
+        self.assertIn('Active account: beta', self.cmd('switch').stdout)
+
     def test_session_id_comes_from_canonical_shared_storage(self):
         self.cmd('init')
         self.cmd('add', 'first')

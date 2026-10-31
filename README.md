@@ -7,7 +7,7 @@ Use either `cam` or `codex-account-manager` — both commands are identical.
 ## What it does
 
 - Reuse an existing native-keyring Codex login without signing in again, and register additional accounts with one-time sign-in.
-- Switch the active account and resume an existing Codex session.
+- Cycle through accounts with `cam switch`, select one with `cam switch NAME`, and resume existing sessions.
 - Share session history, `AGENTS.md`, skills, rules, and `config.toml` across accounts.
 - Let Codex store and refresh account credentials using the native OS keyring; the manager does not copy OAuth tokens.
 - Back up and restore Codex data, optionally encrypting the backup with GPG.
@@ -60,11 +60,19 @@ after removal; **the new profile path requires a new sign-in**.
 ```bash
 cam run                      # Start Codex with the active account
 # Exit Codex before switching
-cam switch second --resume   # Switch and resume the newest session for this project
-cam switch personal          # Switch without opening Codex
+cam switch                  # Rotate to the next registered account
+cam switch --resume         # Rotate and resume the newest session for this project
+cam switch second --resume  # Switch to a specific account and resume
+cam switch personal         # Switch to a specific account without opening Codex
 cam resume                   # Resume the newest session for this project
 cam resume <SESSION_ID>      # Resume a specific session
 ```
+
+Unnamed switching follows registration order and wraps around after the last
+account (A → B → C → A). `cam list` shows the rotation order. If no account is
+selected, unnamed switching selects the first account. At least two accounts
+must be registered. Existing installations without saved order metadata initially
+use alphabetical order; subsequently added accounts are appended.
 
 The long command name works the same way:
 
@@ -83,6 +91,8 @@ Other commands:
 | `cam remove NAME` | Unregister a profile without deleting shared sessions or keyring credentials |
 | `cam remove NAME --forget-login` | Also log out a non-imported profile from the native keyring |
 | `cam list` | List saved profiles and the active profile |
+| `cam switch` | Select the next account in registration order (wraps around) |
+| `cam switch --resume` | Rotate to the next account and resume a local session |
 | `cam switch NAME` | Select an account without starting Codex |
 | `cam switch NAME --resume` | Select an account and resume a local session |
 | `cam run [ARGS...]` | Run Codex with the selected account; pass through Codex arguments |

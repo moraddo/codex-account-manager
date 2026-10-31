@@ -75,6 +75,23 @@ class BackupRestoreTests(unittest.TestCase):
             self.assertIn(b'modified', z.read('codex/AGENTS.md'))
             self.assertNotIn('codex/auth.json', z.namelist())
 
+    def test_round_trip_preserves_account_rotation_order(self):
+        order = self.manager / 'account-order.json'
+        order.write_text('["test"]\n')
+        order.chmod(0o600)
+        self.cmd('backup', str(self.zip))
+        with zipfile.ZipFile(self.zip) as z:
+            self.assertIn('manager/account-order.json', z.namelist())
+        order.write_text('[]\n')
+        self.cmd('restore', str(self.zip))
+        self.assertEqual(json.loads(order.read_text()), ['test'])
+
+    def test_old_backup_without_order_restores_deterministic_order(self):
+        self.cmd('backup', str(self.zip))
+        self.assertFalse((self.manager / 'account-order.json').exists())
+        self.cmd('restore', str(self.zip))
+        self.assertEqual(json.loads((self.manager / 'account-order.json').read_text()), ['test'])
+
     def test_backup_restore_remembers_canonical_profile_mapping(self):
         canonical = self.manager / 'accounts/test/canonical-home.json'
         canonical.write_text('{"use_canonical_home": true}\n')

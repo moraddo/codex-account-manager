@@ -27,6 +27,7 @@ SHARED_DIRS = ("sessions", "archived_sessions", "skills", "rules", "memories", "
 SHARED_FILES = ("history.jsonl", "session_index.jsonl", "AGENTS.md", "hooks.json")
 CONF_KEY = "cli_auth_credentials_store"
 CANONICAL_MARKER = "canonical-home.json"  # Metadata only; never stores credentials
+ORDER_FILE = "account-order.json"  # Registration order; no credentials
 
 
 class CxaError(Exception):
@@ -223,19 +224,52 @@ def import_current(name: str) -> None:
         if check.returncode:
             raise CxaError("No working native-keyring login found under ~/.codex. "
                            "Nothing was imported; your existing Codex login was not changed.")
+        previous = account_names()
         home = setup_profile(name)
         atomic_write(home / CANONICAL_MARKER, b'{"use_canonical_home": true}\n')
+        save_account_order(previous + [name])
         set_active(name)
         print(f"Imported existing native-keyring account as '{name}' without reauthentication")
+
+
+def read_account_order() -> list[str]:
+    """Persist rotation order independently of the active account.
+
+    Pre-existing installations without metadata fall back to alphabetical order.
+    Subsequent registrations append to that order, without renaming profiles.
+    """
+    path = manager_home() / ORDER_FILE
+    if not path.exists() and not path.is_symlink():
+        return []
+    if (path.is_symlink() or not path.is_file()
+            or path.stat().st_uid != os.getuid() or path.stat().st_mode & 0o077):
+        raise CxaError(f"Unsafe account-order metadata: {path}")
+    try:
+        value = json.loads(path.read_text("utf-8"))
+    except (OSError, ValueError) as exc:
+        raise CxaError(f"Invalid account-order metadata: {path}") from exc
+    if (not isinstance(value, list)
+            or any(not isinstance(n, str) or not LABEL.fullmatch(n) for n in value)
+            or len(value) != len(set(value))):
+        raise CxaError(f"Invalid account-order metadata: {path}")
+    return value
 
 
 def account_names() -> list[str]:
     parent = manager_home() / "accounts"
     if not parent.is_dir():
         return []
-    return sorted(p.name for p in parent.iterdir()
-                  if p.is_dir() and not p.is_symlink() and LABEL.fullmatch(p.name)
-                  and (p / "config.toml").is_symlink())
+    current = sorted(p.name for p in parent.iterdir()
+                     if p.is_dir() and not p.is_symlink() and LABEL.fullmatch(p.name)
+                     and (p / "config.toml").is_symlink())
+    saved = read_account_order()
+    return [n for n in saved if n in current] + [n for n in current if n not in saved]
+
+
+def save_account_order(names: list[str]) -> None:
+    if len(names) != len(set(names)) or any(not LABEL.fullmatch(n) for n in names):
+        raise CxaError("Invalid account registration order")
+    atomic_write(manager_home() / ORDER_FILE, (json.dumps(names) + "\n").encode("utf-8"))
 
 
 def get_active() -> str | None:
@@ -306,6 +340,9 @@ def login(name: str, device_auth: bool = False) -> None:
     if name in account_names():
         raise CxaError(f"Profile '{name}' already exists. Use 'cam relogin {name}' to reauthenticate it")
     with lock():
+        previous = account_names()
+        if name in previous:
+            raise CxaError(f"Profile '{name}' already exists")
         home = setup_profile(name)
         env = environment(name)
         command = [codex(), "login"] + (["--device-auth"] if device_auth else [])
@@ -317,6 +354,7 @@ def login(name: str, device_auth: bool = False) -> None:
         check = subprocess.run([codex(), "login", "status"], env=env)
         if check.returncode:
             raise CxaError("Codex did not confirm the keyring login; account not activated")
+        save_account_order(previous + [name])
         set_active(name)
         print(f"Saved account '{name}' in Codex's native OS keyring")
 
@@ -332,10 +370,17 @@ def relogin(name: str, device_auth: bool = False) -> None:
             raise CxaError("Codex login failed")
 
 
-def switch(name: str) -> None:
-    if name not in account_names():
-        raise CxaError(f"Unknown account '{name}'; run 'cam add {name}'")
+def switch(name: str | None = None) -> None:
     with lock():
+        names = account_names()
+        if name is None:
+            if len(names) < 2:
+                raise CxaError("Account rotation requires at least two accounts; use 'cam add NAME'")
+            current = get_active()
+            # If no account is selected, start at the first registered profile.
+            name = names[(names.index(current) + 1) % len(names)] if current in names else names[0]
+        elif name not in names:
+            raise CxaError(f"Unknown account '{name}'; run 'cam add {name}'")
         ensure_no_plaintext(name)
         set_active(name)
     print(f"Active account: {name}")
@@ -376,6 +421,8 @@ def remove_account(name: str, *, forget_login: bool = False) -> None:
         # Same-filesystem rename: never follow profile-local shared symlinks.
         os.rename(home, retired)
         try:
+            # Keep the order compact; re-adding an account appends it at the end.
+            save_account_order([n for n in account_names() if n != name])
             if was_active:
                 set_active(None)
         except Exception:
@@ -521,7 +568,7 @@ def walk_backup_files(source: Path, prefix: str, exclude: set[Path] | None = Non
             except OSError as exc:
                 raise CxaError(f'Cannot inspect {path}: {exc}') from exc
             relative = path.relative_to(source).as_posix()
-            if prefix == 'manager' and relative != 'active.json':
+            if prefix == 'manager' and relative not in ('active.json', ORDER_FILE):
                 # Account profiles are represented by manifest names. Other
                 # profile-local files could contain Codex/MCP login material.
                 continue
@@ -855,6 +902,9 @@ def restore(archive_path: Path, *, dry_run: bool = False) -> None:
                             atomic_write(marker, b'{"use_canonical_home": true}\n')
                         elif marker.exists():
                             marker.unlink()
+                    if f'manager/{ORDER_FILE}' not in manifest['files']:
+                        # Backups created before rotation had no order file.
+                        save_account_order(manifest['accounts'])
                 except (OSError, CxaError) as exc:
                     raise CxaError(f'Restore stopped after partial changes: {exc}. '
                                    f'Original state was saved to {recovery}') from exc
@@ -873,8 +923,8 @@ def main(argv: list[str] | None = None) -> int:
         p.add_argument("--device-auth", action="store_true")
     p = subs.add_parser("import-current", help="Adopt the existing native-keyring login under ~/.codex")
     p.add_argument("name")
-    p = subs.add_parser("switch")
-    p.add_argument("name")
+    p = subs.add_parser("switch", help="Switch to NAME, or rotate to the next registered account")
+    p.add_argument("name", nargs="?", help="Account name (omit to cycle through accounts)")
     p.add_argument("--resume", action="store_true")
     p = subs.add_parser("remove", help="Unregister an account without deleting shared sessions")
     p.add_argument("name")
