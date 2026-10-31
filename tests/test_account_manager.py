@@ -34,6 +34,124 @@ class SecureCliTests(unittest.TestCase):
         self.env = {**os.environ, 'CAM_CODEX_HOME': str(self.codex_home), 'CAM_HOME': str(self.cxa_home),
                     'PATH': f'{self.bin}:{os.environ.get("PATH", "")}', 'TEST_LOG': str(self.log)}
 
+        # Fake Secret Service for offline integration tests. Real credentials
+        # never leave the user's system; this mock uses a dummy token only.
+        self.secret_tool = self.bin / 'secret-tool'
+        self.secret_tool.write_text('''#!/usr/bin/env python3
+import json, os, pathlib, sys
+args = sys.argv[1:]
+db = pathlib.Path(os.environ["TEST_SECRET_DB"])
+entry = db.read_bytes() if db.exists() else b""
+if args[0] == "lookup":
+    sys.stdout.buffer.write(entry)
+    sys.exit(0 if entry else 1)
+if args[0] == "store":
+    if os.environ.get("TEST_REJECT_STORE"):
+        sys.exit(1)
+    db.write_bytes(sys.stdin.buffer.read())
+    sys.exit(0)
+if args[0] == "clear":
+    db.unlink(missing_ok=True)
+    sys.exit(0)
+sys.exit(2)
+''' )
+        self.secret_tool.chmod(0o755)
+        self.secret_db = self.root / 'keyring.fixture'
+        self.env['TEST_SECRET_DB'] = str(self.secret_db)
+        with self.mock.open('a') as f:
+            f.write('''
+if os.environ.get("TEST_ENFORCE_AUTH") and sys.argv[1:] and sys.argv[-2:] == ["login", "status"]:
+    mode = "keyring" if any("keyring" in a for a in sys.argv) else "file"
+    if len(sys.argv) == 3 and sys.argv[1:] == ["login", "status"]:
+        cfg = pathlib.Path(os.environ["CODEX_HOME"]) / "config.toml"
+        if cfg.exists() and 'cli_auth_credentials_store = "keyring"' in cfg.read_text(): mode = "keyring"
+    if mode == "keyring" and (os.environ.get("TEST_KEYRING_VERIFY_FAIL") or not pathlib.Path(os.environ["TEST_SECRET_DB"]).exists()): sys.exit(1)
+    if mode == "file" and not (pathlib.Path(os.environ["CODEX_HOME"]) / "auth.json").exists(): sys.exit(1)
+''' )
+
+    def create_file_auth(self):
+        path = self.codex_home / 'auth.json'
+        path.write_text('''{"auth_mode":"chatgpt","tokens":{"access_token":"FAKE_ACCESS_TOKEN"}}''' )
+        path.chmod(0o600)
+        self.env['TEST_ENFORCE_AUTH'] = '1'
+        return path
+
+    def test_init_migrates_existing_login_without_reauth(self):
+        source = self.create_file_auth()
+        data = source.read_bytes()
+        result = self.cmd('init')
+        self.assertIn('Migrated login', result.stdout)
+        self.assertFalse(source.exists())
+        self.assertEqual(data, self.secret_db.read_bytes())
+        self.assertIn('cli_auth_credentials_store = "keyring"', (self.codex_home / 'config.toml').read_text())
+        self.assertEqual([e['cmd'] for e in self.events()],
+                         [['-c', 'cli_auth_credentials_store="file"', 'login', 'status'],
+                          ['-c', 'cli_auth_credentials_store="keyring"', 'login', 'status'],
+                          ['-c', 'cli_auth_credentials_store="keyring"', 'login', 'status']])
+
+    def test_import_current_auto_migrates_existing_file(self):
+        self.create_file_auth()
+        self.cmd('import-current', 'my_existing_account')
+        self.assertFalse((self.codex_home / 'auth.json').exists())
+        self.assertTrue((self.cxa_home / 'accounts/my_existing_account/canonical-home.json').exists())
+        self.assertIn('my_existing_account', self.cmd('list').stdout)
+
+    def test_migrate_auth_command_is_idempotent_when_no_file(self):
+        self.create_file_auth()
+        self.cmd('migrate-auth')
+        self.assertIn('nothing to migrate', self.cmd('migrate-auth').stdout)
+
+    def test_migration_rejects_existing_keyring_entry_without_overwriting(self):
+        source = self.create_file_auth()
+        self.secret_db.write_text('OTHER_ACCOUNT_SECRET')
+        result = self.cmd('init', success=False)
+        self.assertIn('different keyring entry', result.stderr)
+        self.assertTrue(source.exists())
+        self.assertEqual(self.secret_db.read_text(), 'OTHER_ACCOUNT_SECRET')
+        self.assertIn('cli_auth_credentials_store = "file"', (self.codex_home / 'config.toml').read_text())
+
+    def test_migration_failed_keyring_write_preserves_file_and_config(self):
+        source = self.create_file_auth()
+        self.env['TEST_REJECT_STORE'] = '1'
+        result = self.cmd('init', success=False)
+        self.assertIn('rejected the credentials', result.stderr)
+        self.assertTrue(source.exists())
+        self.assertIn('cli_auth_credentials_store = "file"', (self.codex_home / 'config.toml').read_text())
+
+    def test_migration_failed_keyring_verification_preserves_file_and_config(self):
+        source = self.create_file_auth()
+        self.env['TEST_KEYRING_VERIFY_FAIL'] = '1'
+        result = self.cmd('init', success=False)
+        self.assertIn('could not verify keyring-only login', result.stderr)
+        self.assertTrue(source.exists())
+        self.assertIn('cli_auth_credentials_store = "file"', (self.codex_home / 'config.toml').read_text())
+
+    def test_migration_refuses_symlinked_auth(self):
+        actual = self.root / 'should-not-be-read'
+        actual.write_text('token')
+        (self.codex_home / 'auth.json').symlink_to(actual)
+        failure = self.cmd('init', success=False)
+        self.assertIn('unsafe auth.json', failure.stderr)
+        self.assertTrue((self.codex_home / 'auth.json').is_symlink())
+        self.assertFalse(self.secret_db.exists())
+
+    def test_migration_rejects_broad_file_permissions(self):
+        source = self.create_file_auth()
+        source.chmod(0o644)
+        failure = self.cmd('init', success=False)
+        self.assertIn('chmod 600', failure.stderr)
+        self.assertTrue(source.exists())
+        self.assertFalse(self.secret_db.exists())
+
+    def test_migration_missing_secret_tool(self):
+        source = self.create_file_auth()
+        self.secret_tool.unlink()
+        failure = self.cmd('init', success=False)
+        # If real system secret-tool exists, command will still fail as the
+        # test is not running against the real desktop's keyring.
+        self.assertNotEqual(failure.returncode, 0)
+        self.assertTrue(source.exists())
+
     def cmd(self, *args, success=True):
         result = subprocess.run([sys.executable, str(SOURCE), *args], env=self.env, text=True, capture_output=True)
         if success:

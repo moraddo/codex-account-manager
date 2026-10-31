@@ -6,10 +6,10 @@ Use either `cam` or `codex-account-manager` — both commands are identical.
 
 ## What it does
 
-- Reuse an existing native-keyring Codex login without signing in again, and register additional accounts with one-time sign-in.
+- Import an existing Codex login without signing in again, including automatic migration from `~/.codex/auth.json` to the native Linux keyring.
 - Cycle through accounts with `cam switch`, select one with `cam switch NAME`, and resume existing sessions.
 - Share session history, `AGENTS.md`, skills, rules, and `config.toml` across accounts.
-- Let Codex store and refresh account credentials using the native OS keyring; the manager does not copy OAuth tokens.
+- Let Codex store and refresh account credentials using the native OS keyring. During file-backed login migration, tokens stream directly from the existing file into the keyring without an extra plaintext copy.
 - Back up and restore Codex data, optionally encrypting the backup with GPG.
 
 Account switching is **manual**, not automatic on quota exhaustion. Stop the current Codex session before switching; an interrupted model request is not transferred mid-generation.
@@ -19,6 +19,7 @@ Account switching is **manual**, not automatic on quota exhaustion. Stop the cur
 - Linux with a working, unlocked OS keyring (for example, GNOME Keyring).
 - Codex CLI installed and available as `codex` in `PATH`, with support for `cli_auth_credentials_store = "keyring"` and `CODEX_SQLITE_HOME`.
 - Python 3.11 or newer (standard library only).
+- `libsecret-tools` (`secret-tool`) to migrate an existing file-backed Codex login (Ubuntu: `sudo apt install libsecret-tools`).
 - GnuPG (`gpg`) for encrypted backups.
 
 ## Installation
@@ -32,21 +33,25 @@ cam init
 
 The installer creates `~/.local/bin/cam` and `~/.local/bin/codex-account-manager`. Make sure `~/.local/bin` is on your `PATH`.
 
-`cam init` enables native keyring authentication in `~/.codex/config.toml` and keeps your existing Codex configuration and sessions. If an `~/.codex/auth.json` exists, initialization stops without changing the configuration or credentials. This avoids unintentionally logging you out while changing storage modes.
+`cam init` configures native keyring authentication in `~/.codex/config.toml` and preserves existing Codex sessions. If `~/.codex/auth.json` contains your current login, initialization **migrates it automatically** using the Linux Secret Service and verifies it with Codex in keyring-only mode before deleting the plaintext file. The original file and configuration are retained if migration fails. Close all Codex processes first, and ensure your desktop keyring is unlocked.
+
+To migrate separately, run `cam migrate-auth`. It is safe to run when there is no file-backed login; it then makes no changes.
 
 ## Usage
 
 ### Register accounts
 
 ```bash
-cam import-current personal  # Adopt existing ~/.codex keyring login without reauthentication
+cam import-current personal  # Import existing login, migrating auth.json if necessary
 cam add second               # Authenticate the second account once
 cam list                     # List accounts (* marks the active one)
 cam remove wrong-name        # Unregister a profile without deleting shared data
 cam import-current correct   # Re-import the existing ~/.codex login under a new name
 ```
 
-`cam import-current NAME` only works when the existing `~/.codex` login is already stored in the OS keyring and `~/.codex/auth.json` is absent. It checks the login without reading, copying, or exporting tokens. If Codex still uses `auth.json`, moving to native keyring storage requires a separate migration (typically signing in once). The command refuses to import it insecurely.
+`cam import-current NAME` also performs the one-time secure migration if `~/.codex/auth.json` is present. No browser reauthentication is normally required. Migration never sends token values through CLI arguments, environment variables, terminal output, or a second plaintext file. It fails closed if the keyring is unavailable, Codex cannot verify the keyring entry, the credential file is unsafe, or a different login is already stored under the same keyring identity. The original file remains in place on failure.
+
+If migration reports `auth.json is readable by other users`, first run `chmod 600 ~/.codex/auth.json` and retry. If it cannot find `secret-tool`, install `libsecret-tools` and make sure GNOME Keyring is unlocked.
 
 For device-code sign-in, use `cam add second --device-auth`.
 
@@ -84,8 +89,9 @@ Other commands:
 
 | Command | Purpose |
 | --- | --- |
-| `cam init` | Initialize shared configuration and require keyring credentials |
-| `cam import-current NAME` | Reuse the current native-keyring login without reauthenticating |
+| `cam init` | Configure keyring and migrate an existing `auth.json`, if present |
+| `cam migrate-auth` | Migrate existing file-backed login to keyring without signing in |
+| `cam import-current NAME` | Import the current login, migrating file-backed auth if necessary |
 | `cam add NAME` | Create an account profile and sign in |
 | `cam relogin NAME` | Sign in again if an account's login expires or is revoked |
 | `cam remove NAME` | Unregister a profile without deleting shared sessions or keyring credentials |
@@ -151,10 +157,11 @@ Restore verifies archive paths and checksums before writing and saves a local re
 
 ## Security and limitations
 
-- Imported existing login uses its original `~/.codex` and keyring entry; additional accounts use separate `CODEX_HOME` paths and keyring entries. Shared session/configuration files are linked; credentials are never linked or copied.
+- Imported existing login uses its original `~/.codex` and keyring entry; additional accounts use separate `CODEX_HOME` paths and keyring entries. Shared session/configuration files are linked. File-backed credentials are only read for a one-time direct import to keyring, not copied to another plaintext file.
 - Keyring storage protects credentials at rest, **not against malware operating within your unlocked user session**. Protect your device and backups accordingly.
 - Exit Codex before account switching, backup, or restore. Running multiple Codex clients against shared state can cause inconsistent behavior; checks for unmanaged processes are best-effort.
 - Cross-account session resumption depends on Codex's session format and may behave differently across Codex releases. Test with a disposable session before relying on it for critical work.
+- Migration uses Codex's current Linux direct-keyring format (`service=Codex Auth`, `username=cli|…`). The tool verifies compatibility with your installed Codex version before removing `auth.json`. A later Codex release may change the keyring format, in which case migration stops without deleting the original login.
 - The CLI is Linux-only. It does not automatically rotate accounts at quota limits.
 
 ## Tests

@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """Codex Account Manager: native keyring per account; shared session data.
 
-No OAuth tokens are read, copied, logged, or written by this application.
-Linux only. Works by selecting a distinct CODEX_HOME for each account.
+Linux only. Existing file-backed logins can be streamed directly into the
+OS keyring using secret-tool, without logging or persisting extra token copies.
 """
 from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -84,16 +85,8 @@ def atomic_write(path: Path, data: bytes) -> None:
             os.unlink(tmp)
 
 
-def initialize() -> None:
-    if root_home().is_symlink():
-        raise CxaError("Refusing symlinked shared Codex home")
-    # Do not make an existing file-based login inaccessible by switching the
-    # config to keyring mode. Codex does not automatically migrate its token
-    # into the keyring merely because this option was changed.
-    if os.path.lexists(root_home() / "auth.json"):
-        raise CxaError("Existing Codex authentication is stored at ~/.codex/auth.json. "
-                       "Refusing to change credential storage and disrupt your login. "
-                       "Move to native Codex keyring storage first; then run cam init.")
+def _configure_keyring() -> None:
+    """Configure native keyring without modifying any credential file."""
     private_dir(root_home())
     private_dir(manager_home())
     private_dir(manager_home() / "accounts")
@@ -132,8 +125,165 @@ def initialize() -> None:
         print(f"Set cli_auth_credentials_store=keyring in {config}")
     else:
         print("Codex already configured to use the native OS keyring")
-    print("No plaintext Codex auth.json was touched; use 'cam doctor' for security checks.")
+    print("Codex credential files are unchanged by configuration; use 'cam doctor' for security checks.")
 
+
+
+
+def _auth_environment() -> dict[str, str]:
+    """Ensure authentication checks cannot succeed via an injected API key."""
+    env = dict(os.environ)
+    env["CODEX_HOME"] = str(root_home())
+    env["CODEX_SQLITE_HOME"] = str(shared_sqlite_home())
+    for key in ("OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_HOME_OVERRIDE"):
+        env.pop(key, None)
+    return env
+
+
+def _codex_auth_status(mode: str) -> bool:
+    try:
+        result = subprocess.run(
+            [codex(), "-c", f'{CONF_KEY}="{mode}"', "login", "status"],
+            env=_auth_environment(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=25,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise CxaError(f"Unable to check Codex {mode}-backed authentication: {type(exc).__name__}") from exc
+    return result.returncode == 0
+
+
+def _keyring_account_key() -> str:
+    # Codex key: sha256(canonical CODEX_HOME path)[:16], prefixed by 'cli|'.
+    digest = hashlib.sha256(str(root_home().resolve()).encode("utf-8")).hexdigest()[:16]
+    return "cli|" + digest
+
+
+def _keyring_attributes() -> list[str]:
+    # Codex's Linux direct keyring backend uses keyring-rs/Secret Service.
+    return ["service", "Codex Auth", "username", _keyring_account_key()]
+
+
+def _secret_tool(*args: str, stdin=None) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(
+            ["secret-tool", *args], stdin=stdin, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise CxaError(f"OS keyring operation failed: {type(exc).__name__}") from exc
+
+
+def migrate_auth_json() -> None:
+    """Migrate ~/.codex/auth.json using the Linux Secret Service, without re-login.
+
+    This is intentionally fail-closed. No auth file is removed until Codex
+    independently verifies the new keyring entry. We never pass tokens through
+    argv, environment, terminal output, logs, or temporary files.
+    """
+    path = root_home() / "auth.json"
+    if not os.path.lexists(path):
+        return
+    if root_home().is_symlink():
+        raise CxaError("Refusing symlinked Codex home")
+    reject_running_codex()
+    if shutil.which("secret-tool") is None:
+        raise CxaError("Install Linux keyring utilities: sudo apt install libsecret-tools. "
+                       "Original auth.json was not changed.")
+    config = root_home() / "config.toml"
+    if config.is_symlink():
+        raise CxaError("Refusing symlinked Codex config")
+    if config.exists():
+        parsed = tomllib.loads(config.read_text("utf-8"))
+        if parsed.get("auth_keyring_backend_kind", "direct") != "direct":
+            raise CxaError("Migration supports only Codex's native Linux direct keyring backend")
+
+    # An existing keyring entry might represent a different account. Never overwrite.
+    lookup = _secret_tool("lookup", *_keyring_attributes())
+    # libsecret returns status 1 with no stderr if a key does not exist;
+    # failure to contact the service also returns 1, but reports stderr.
+    if lookup.returncode not in (0, 1) or lookup.stderr or (lookup.returncode == 0 and not lookup.stdout):
+        raise CxaError("Cannot inspect the OS keyring (is it unlocked?). "
+                       "Original auth.json was not changed.")
+    existing_keyring_secret = lookup.stdout  # Never log or write this secret.
+    del lookup
+
+    # Open without following links; reject suspicious ownership or non-regular files.
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError as exc:
+        raise CxaError(f"Refusing unsafe auth.json: {exc.strerror}") from exc
+    with os.fdopen(fd, "rb") as source:
+        info = os.fstat(source.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+            raise CxaError("auth.json must be a regular file owned by the current user")
+        if info.st_mode & 0o077:
+            raise CxaError("auth.json is readable by other users. Run chmod 600 ~/.codex/auth.json "
+                           "and retry; no credentials were copied.")
+        if info.st_size == 0 or info.st_size > 1024 * 1024:
+            raise CxaError("Unexpected auth.json size; refusing migration")
+        if not _codex_auth_status("file"):
+            raise CxaError("Codex cannot verify the existing file login. "
+                           "Original auth.json was not changed.")
+        # If an earlier migration was interrupted, allow retry only when
+        # the existing keyring secret is byte-for-byte equal to the file.
+        if existing_keyring_secret:
+            source.seek(0)
+            if source.read() != existing_keyring_secret:
+                raise CxaError("Codex already has a different keyring entry for this home. "
+                               "Refusing to overwrite it or delete auth.json.")
+            print("Matching Codex keyring entry found; completing earlier migration...", flush=True)
+        previous_config = config.read_bytes() if config.exists() else None
+        created_keyring_entry = False
+        try:
+            if not existing_keyring_secret:
+                source.seek(0)
+                print("Moving existing Codex login into native Linux keyring...", flush=True)
+                saved = _secret_tool("store", "--label=Codex Auth", *_keyring_attributes(), stdin=source)
+                if saved.returncode:
+                    raise CxaError("OS keyring rejected the credentials; auth.json was preserved. "
+                                   "Check that your desktop keyring is unlocked.")
+                created_keyring_entry = True
+            # Codex must read this specific keyring entry with file fallback disabled.
+            if not _codex_auth_status("keyring"):
+                raise CxaError("Codex could not verify keyring-only login; "
+                               "auth.json was preserved. Check your Codex version/backend.")
+            _configure_keyring()
+            if not _codex_auth_status("keyring"):
+                raise CxaError("Keyring login failed after configuration change; "
+                               "auth.json was preserved.")
+            # Detect any unexpected concurrent credential refresh or replacement.
+            current = path.lstat()
+            if (current.st_ino, current.st_size, current.st_mtime_ns) != (info.st_ino, info.st_size, info.st_mtime_ns):
+                raise CxaError("auth.json changed during migration; refusing deletion")
+            reject_running_codex()
+            path.unlink()
+        except (CxaError, OSError):
+            # Keep the previous file-based login intact on every failure.
+            if path.exists():
+                try:
+                    if previous_config is None:
+                        if config.exists():
+                            config.unlink()
+                    elif config.exists() and config.read_bytes() != previous_config:
+                        atomic_write(config, previous_config)
+                except OSError:
+                    print("WARNING: Could not restore config.toml; original auth.json still exists.",
+                          file=sys.stderr)
+                if created_keyring_entry:
+                    # Remove only the entry that *this invocation* created.
+                    cleanup = _secret_tool("clear", *_keyring_attributes())
+                    if cleanup.returncode:
+                        print("WARNING: Could not roll back new keyring entry.", file=sys.stderr)
+            raise
+    print("Migrated login to native keyring; removed the original plaintext auth.json.")
+
+
+def initialize() -> None:
+    if os.path.lexists(root_home() / "auth.json"):
+        migrate_auth_json()
+    if os.path.lexists(root_home() / "auth.json"):
+        raise CxaError("auth.json still exists; refusing insecure initialization")
+    _configure_keyring()
 
 def shared_sqlite_home() -> Path:
     config = root_home() / "config.toml"
@@ -206,9 +356,7 @@ def import_current(name: str) -> None:
     """Adopt an existing native-keyring login without reading/copying its tokens."""
     with lock():
         if os.path.lexists(root_home() / "auth.json"):
-            raise CxaError("Existing login uses or retains ~/.codex/auth.json. "
-                           "Import requires native keyring credentials; no plaintext tokens are copied. "
-                           "Migrate the existing login to keyring before importing.")
+            initialize()  # Includes safe file-to-keyring migration when needed.
         validate_config()
         reject_running_codex()
         if name in account_names():
@@ -916,7 +1064,8 @@ def restore(archive_path: Path, *, dry_run: bool = False) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="cam", description="Codex multi-account switcher using native OS keyring")
     subs = parser.add_subparsers(dest="action", required=True)
-    subs.add_parser("init", help="Configure native keyring; preserve all existing Codex state")
+    subs.add_parser("init", help="Initialize keyring; automatically migrate an existing auth.json")
+    subs.add_parser("migrate-auth", help="Migrate existing auth.json to native keyring without signing in")
     for name in ("add", "relogin"):
         p = subs.add_parser(name)
         p.add_argument("name")
@@ -950,6 +1099,12 @@ def main(argv: list[str] | None = None) -> int:
         if args.action == "init":
             with lock():
                 initialize()
+        elif args.action == "migrate-auth":
+            with lock():
+                if os.path.lexists(root_home() / "auth.json"):
+                    migrate_auth_json()
+                else:
+                    print("No auth.json found; nothing to migrate.")
         elif args.action == "add":
             login(args.name, args.device_auth)
         elif args.action == "import-current":
