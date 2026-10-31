@@ -118,6 +118,137 @@ class SecureCliTests(unittest.TestCase):
         self.assertEqual(self.events()[-1]['cmd'], ['resume', session_id])
         self.assertEqual(self.events()[-1]['home'], str(self.cxa_home / 'accounts' / 'second'))
 
+    def test_import_current_uses_original_home_without_reauthentication(self):
+        self.cmd('init')
+        self.cmd('import-current', 'original')
+        self.assertEqual([x['cmd'] for x in self.events()], [['login', 'status']])
+        self.assertEqual(self.events()[0]['home'], str(self.codex_home))
+        marker = self.cxa_home / 'accounts/original/canonical-home.json'
+        self.assertEqual(json.loads(marker.read_text()), {'use_canonical_home': True})
+        self.cmd('run')
+        self.assertEqual(self.events()[-1]['home'], str(self.codex_home))
+        self.cmd('add', 'secondary')
+        self.cmd('switch', 'secondary')
+        self.cmd('run')
+        self.assertEqual(self.events()[-1]['home'], str(self.cxa_home / 'accounts/secondary'))
+        self.cmd('switch', 'original')
+        self.cmd('run')
+        self.assertEqual(self.events()[-1]['home'], str(self.codex_home))
+        self.assertFalse(any(x['cmd'] == ['login'] and x['home'] == str(self.codex_home) for x in self.events()))
+        self.assertEqual(self.cmd('import-current', 'duplicate', success=False).returncode, 1)
+
+    def test_remove_active_profile_preserves_shared_data_and_other_account(self):
+        self.cmd('init')
+        self.cmd('add', 'typo')
+        self.cmd('add', 'second')
+        self.cmd('switch', 'typo')
+        sessions = self.codex_home / 'sessions'
+        (sessions / 'important.jsonl').write_text('original work')
+        profile = self.cxa_home / 'accounts/typo'
+        (profile / 'local-cache.txt').write_text('local data')
+        result = self.cmd('remove', 'typo')
+        self.assertIn("Removed account 'typo'", result.stdout)
+        self.assertFalse(profile.exists())
+        self.assertIn('second', self.cmd('list').stdout)
+        self.assertNotIn('typo', self.cmd('list').stdout)
+        self.assertEqual(json.loads((self.cxa_home / 'active.json').read_text()), {'active': None})
+        self.assertEqual((sessions / 'important.jsonl').read_text(), 'original work')
+        self.assertTrue((self.codex_home / 'config.toml').exists())
+        archive = list((self.cxa_home / 'removed-accounts').glob('typo-*'))
+        self.assertEqual(len(archive), 1)
+        self.assertEqual((archive[0] / 'local-cache.txt').read_text(), 'local data')
+        self.assertTrue((archive[0] / 'sessions').is_symlink())
+        self.assertNotIn(['logout'], [x['cmd'] for x in self.events()])
+        self.cmd('add', 'correct')
+        self.assertIn('correct', self.cmd('list').stdout)
+        self.cmd('switch', 'second')
+        self.cmd('run')
+        self.assertEqual(self.events()[-1]['home'], str(self.cxa_home / 'accounts/second'))
+
+    def test_remove_imported_then_reimport_correct_name_without_login(self):
+        self.cmd('init')
+        self.cmd('import-current', 'typo')
+        self.cmd('remove', 'typo')
+        self.cmd('import-current', 'correct')
+        self.cmd('run')
+        self.assertEqual(self.events()[-1]['home'], str(self.codex_home))
+        commands = [x['cmd'] for x in self.events()]
+        self.assertEqual(commands.count(['login']), 0)
+        self.assertEqual(commands.count(['login', 'status']), 2)
+        self.assertNotIn(['logout'], commands)
+        self.assertIn('correct', self.cmd('list').stdout)
+        self.assertNotIn('typo', self.cmd('list').stdout)
+
+    def test_remove_inactive_does_not_change_active(self):
+        self.cmd('init')
+        self.cmd('add', 'first')
+        self.cmd('add', 'second')
+        self.cmd('remove', 'first')
+        self.assertEqual(json.loads((self.cxa_home / 'active.json').read_text()), {'active': 'second'})
+        self.cmd('run')
+        self.assertEqual(self.events()[-1]['home'], str(self.cxa_home / 'accounts/second'))
+
+    def test_remove_managed_with_optional_logout(self):
+        self.cmd('init')
+        self.cmd('add', 'managed')
+        self.cmd('remove', 'managed', '--forget-login')
+        self.assertEqual(self.events()[-1]['cmd'], ['logout'])
+        self.assertEqual(self.events()[-1]['home'], str(self.cxa_home / 'accounts/managed'))
+        self.assertFalse((self.cxa_home / 'accounts/managed').exists())
+
+    def test_remove_imported_refuses_to_logout_original(self):
+        self.cmd('init')
+        self.cmd('import-current', 'original')
+        result = self.cmd('remove', 'original', '--forget-login', success=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Refusing --forget-login', result.stderr)
+        self.assertTrue((self.cxa_home / 'accounts/original').is_dir())
+        self.assertFalse(any(x['cmd'] == ['logout'] for x in self.events()))
+        self.cmd('run')
+        self.assertEqual(self.events()[-1]['home'], str(self.codex_home))
+
+    def test_remove_invalid_unknown_symlink_and_logout_failure(self):
+        self.cmd('init')
+        self.cmd('add', 'managed')
+        for label in ('absent', '../managed'):
+            self.assertNotEqual(self.cmd('remove', label, success=False).returncode, 0)
+        self.assertTrue((self.cxa_home / 'accounts/managed').is_dir())
+        # Logout errors must not unregister the profile.
+        self.mock.write_text(self.mock.read_text() + '\nif sys.argv[1:] == ["logout"]: sys.exit(2)\n')
+        result = self.cmd('remove', 'managed', '--forget-login', success=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue((self.cxa_home / 'accounts/managed').is_dir())
+        # Even if the logout mock is failing, regular safe removal remains available.
+        self.cmd('remove', 'managed')
+
+    def test_remove_disallows_plaintext_auth(self):
+        self.cmd('init')
+        self.cmd('add', 'first')
+        path = self.cxa_home / 'accounts/first/auth.json'
+        path.write_text('DO_NOT_COPY')
+        failure = self.cmd('remove', 'first', success=False)
+        self.assertNotEqual(failure.returncode, 0)
+        self.assertTrue(path.exists())
+        self.assertFalse((self.cxa_home / 'removed-accounts').exists())
+
+    def test_import_current_refuses_existing_auth_json_without_reading_it(self):
+        secret = self.codex_home / 'auth.json'
+        secret.write_text('DO_NOT_READ_OR_DELETE')
+        self.cmd('init', success=False)
+        result = self.cmd('import-current', 'original', success=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('auth.json', result.stderr)
+        self.assertEqual(secret.read_text(), 'DO_NOT_READ_OR_DELETE')
+        self.assertFalse((self.cxa_home / 'accounts/original/canonical-home.json').exists())
+
+    def test_import_current_refuses_missing_keyring_login(self):
+        self.cmd('init')
+        # Mock `codex login status` failure; must not create account metadata.
+        self.mock.write_text(self.mock.read_text() + '\nif sys.argv[1:] == ["login", "status"]: sys.exit(1)\n')
+        result = self.cmd('import-current', 'original', success=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((self.cxa_home / 'accounts/original').exists())
+
     def test_fail_closed_on_profile_plaintext(self):
         self.cmd('init')
         self.cmd('add', 'first')
@@ -132,8 +263,11 @@ class SecureCliTests(unittest.TestCase):
 
     def test_no_legacy_auth_deleted(self):
         (self.codex_home / 'auth.json').write_text('legacy')
-        self.cmd('init')
+        original = (self.codex_home / 'config.toml').read_text()
+        failure = self.cmd('init', success=False)
+        self.assertNotEqual(failure.returncode, 0)
         self.assertEqual((self.codex_home / 'auth.json').read_text(), 'legacy')
+        self.assertEqual((self.codex_home / 'config.toml').read_text(), original)
         self.assertIn('plaintext credentials', self.cmd('doctor').stdout)
 
 

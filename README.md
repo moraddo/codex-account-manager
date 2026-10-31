@@ -6,7 +6,7 @@ Use either `cam` or `codex-account-manager` — both commands are identical.
 
 ## What it does
 
-- Register multiple Codex accounts with one-time sign-in per account.
+- Reuse an existing native-keyring Codex login without signing in again, and register additional accounts with one-time sign-in.
 - Switch the active account and resume an existing Codex session.
 - Share session history, `AGENTS.md`, skills, rules, and `config.toml` across accounts.
 - Let Codex store and refresh account credentials using the native OS keyring; the manager does not copy OAuth tokens.
@@ -32,19 +32,28 @@ cam init
 
 The installer creates `~/.local/bin/cam` and `~/.local/bin/codex-account-manager`. Make sure `~/.local/bin` is on your `PATH`.
 
-`cam init` enables native keyring authentication in `~/.codex/config.toml` and keeps your existing Codex configuration and sessions. It does **not** delete an existing `~/.codex/auth.json`; check for leftover file-based credentials with `cam doctor`.
+`cam init` enables native keyring authentication in `~/.codex/config.toml` and keeps your existing Codex configuration and sessions. If an `~/.codex/auth.json` exists, initialization stops without changing the configuration or credentials. This avoids unintentionally logging you out while changing storage modes.
 
 ## Usage
 
 ### Register accounts
 
 ```bash
-cam add personal             # Authenticate once using the browser
+cam import-current personal  # Adopt existing ~/.codex keyring login without reauthentication
 cam add second               # Authenticate the second account once
 cam list                     # List accounts (* marks the active one)
+cam remove wrong-name        # Unregister a profile without deleting shared data
+cam import-current correct   # Re-import the existing ~/.codex login under a new name
 ```
 
-For device-code sign-in, use `cam add personal --device-auth`.
+`cam import-current NAME` only works when the existing `~/.codex` login is already stored in the OS keyring and `~/.codex/auth.json` is absent. It checks the login without reading, copying, or exporting tokens. If Codex still uses `auth.json`, moving to native keyring storage requires a separate migration (typically signing in once). The command refuses to import it insecurely.
+
+For device-code sign-in, use `cam add second --device-auth`.
+
+To correct the name of an imported login, use `cam remove wrong-name` followed by
+`cam import-current correct`. This reuses your original `~/.codex` keyring login
+without reauthentication. For a separately added account, use `cam add correct`
+after removal; **the new profile path requires a new sign-in**.
 
 ### Switch accounts and continue a session
 
@@ -68,8 +77,11 @@ Other commands:
 | Command | Purpose |
 | --- | --- |
 | `cam init` | Initialize shared configuration and require keyring credentials |
+| `cam import-current NAME` | Reuse the current native-keyring login without reauthenticating |
 | `cam add NAME` | Create an account profile and sign in |
 | `cam relogin NAME` | Sign in again if an account's login expires or is revoked |
+| `cam remove NAME` | Unregister a profile without deleting shared sessions or keyring credentials |
+| `cam remove NAME --forget-login` | Also log out a non-imported profile from the native keyring |
 | `cam list` | List saved profiles and the active profile |
 | `cam switch NAME` | Select an account without starting Codex |
 | `cam switch NAME --resume` | Select an account and resume a local session |
@@ -80,6 +92,29 @@ Other commands:
 | `cam restore FILE` | Validate and restore a backup |
 
 For example, `cam run exec "fix the failing tests"` passes `exec` and its arguments to Codex.
+
+### Remove an account
+
+```bash
+cam list
+cam remove wrong-name
+cam add correct-name           # Sign in once for the replacement managed profile
+# OR, for an imported original ~/.codex login:
+cam import-current correct-name  # Reuses its existing keyring login
+```
+
+Remove requires all Codex processes to be stopped. The removed profile is moved
+into `~/.local/share/codex-account-manager/removed-accounts/` (or the configured
+`CAM_HOME`) instead of deleting unknown files. If it was active, no account is
+selected until you explicitly switch or add an account. The original `~/.codex`
+home, shared sessions, and Codex configuration are never removed.
+
+By default, removal **does not delete native keyring credentials**. Use
+`cam remove NAME --forget-login` to also run `codex logout` for a non-imported
+profile. The tool intentionally refuses this flag for an imported `~/.codex`
+account to avoid unexpectedly signing you out of your normal Codex installation.
+Retired profile directories are excluded from backups; inspect and delete them
+manually when no longer needed.
 
 ## Backup and restore
 
@@ -106,7 +141,7 @@ Restore verifies archive paths and checksums before writing and saves a local re
 
 ## Security and limitations
 
-- Each account has its own `CODEX_HOME` and native keyring entry. Shared session/configuration files are linked to the canonical `~/.codex` directory; credentials are not linked or copied.
+- Imported existing login uses its original `~/.codex` and keyring entry; additional accounts use separate `CODEX_HOME` paths and keyring entries. Shared session/configuration files are linked; credentials are never linked or copied.
 - Keyring storage protects credentials at rest, **not against malware operating within your unlocked user session**. Protect your device and backups accordingly.
 - Exit Codex before account switching, backup, or restore. Running multiple Codex clients against shared state can cause inconsistent behavior; checks for unmanaged processes are best-effort.
 - Cross-account session resumption depends on Codex's session format and may behave differently across Codex releases. Test with a disposable session before relying on it for critical work.

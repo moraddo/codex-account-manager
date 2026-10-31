@@ -75,6 +75,19 @@ class BackupRestoreTests(unittest.TestCase):
             self.assertIn(b'modified', z.read('codex/AGENTS.md'))
             self.assertNotIn('codex/auth.json', z.namelist())
 
+    def test_backup_restore_remembers_canonical_profile_mapping(self):
+        canonical = self.manager / 'accounts/test/canonical-home.json'
+        canonical.write_text('{"use_canonical_home": true}\n')
+        canonical.chmod(0o600)
+        self.cmd('backup', str(self.zip))
+        with zipfile.ZipFile(self.zip) as z:
+            manifest = json.loads(z.read('manifest.json'))
+            self.assertEqual(manifest['canonical_accounts'], ['test'])
+            self.assertNotIn('manager/accounts/test/canonical-home.json', z.namelist())
+        canonical.unlink()
+        self.cmd('restore', str(self.zip))
+        self.assertEqual(json.loads(canonical.read_text()), {'use_canonical_home': True})
+
     def test_dry_run_does_not_change_anything(self):
         self.cmd('backup', str(self.zip))
         (self.codex / 'AGENTS.md').write_text('different')

@@ -13,6 +13,7 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import shutil
 import stat
 import subprocess
@@ -25,6 +26,7 @@ LABEL = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,47}$")
 SHARED_DIRS = ("sessions", "archived_sessions", "skills", "rules", "memories", "prompts", "plugins")
 SHARED_FILES = ("history.jsonl", "session_index.jsonl", "AGENTS.md", "hooks.json")
 CONF_KEY = "cli_auth_credentials_store"
+CANONICAL_MARKER = "canonical-home.json"  # Metadata only; never stores credentials
 
 
 class CxaError(Exception):
@@ -84,6 +86,13 @@ def atomic_write(path: Path, data: bytes) -> None:
 def initialize() -> None:
     if root_home().is_symlink():
         raise CxaError("Refusing symlinked shared Codex home")
+    # Do not make an existing file-based login inaccessible by switching the
+    # config to keyring mode. Codex does not automatically migrate its token
+    # into the keyring merely because this option was changed.
+    if os.path.lexists(root_home() / "auth.json"):
+        raise CxaError("Existing Codex authentication is stored at ~/.codex/auth.json. "
+                       "Refusing to change credential storage and disrupt your login. "
+                       "Move to native Codex keyring storage first; then run cam init.")
     private_dir(root_home())
     private_dir(manager_home())
     private_dir(manager_home() / "accounts")
@@ -122,7 +131,7 @@ def initialize() -> None:
         print(f"Set cli_auth_credentials_store=keyring in {config}")
     else:
         print("Codex already configured to use the native OS keyring")
-    print("Existing auth.json was NOT deleted; use 'cam doctor' to check for legacy secrets.")
+    print("No plaintext Codex auth.json was touched; use 'cam doctor' for security checks.")
 
 
 def shared_sqlite_home() -> Path:
@@ -171,6 +180,55 @@ def setup_profile(name: str) -> Path:
     return home
 
 
+def is_canonical_profile(name: str) -> bool:
+    """A managed name may use the existing ~/.codex keyring identity in-place."""
+    marker = profile_home(name) / CANONICAL_MARKER
+    if not marker.exists():
+        return False
+    if marker.is_symlink() or not marker.is_file() or marker.stat().st_mode & 0o077:
+        raise CxaError(f"Unsafe canonical profile metadata: {marker}")
+    try:
+        value = json.loads(marker.read_text("utf-8"))
+    except (OSError, ValueError) as exc:
+        raise CxaError(f"Invalid canonical profile metadata: {marker}") from exc
+    if value != {"use_canonical_home": True}:
+        raise CxaError(f"Invalid canonical profile metadata: {marker}")
+    return True
+
+
+def account_home(name: str) -> Path:
+    home = profile_home(name)
+    return root_home() if is_canonical_profile(name) else home
+
+
+def import_current(name: str) -> None:
+    """Adopt an existing native-keyring login without reading/copying its tokens."""
+    with lock():
+        if os.path.lexists(root_home() / "auth.json"):
+            raise CxaError("Existing login uses or retains ~/.codex/auth.json. "
+                           "Import requires native keyring credentials; no plaintext tokens are copied. "
+                           "Migrate the existing login to keyring before importing.")
+        validate_config()
+        reject_running_codex()
+        if name in account_names():
+            raise CxaError(f"Profile '{name}' already exists")
+        if any(is_canonical_profile(other) for other in account_names()):
+            raise CxaError("The canonical Codex login is already imported")
+        env = dict(os.environ)
+        env["CODEX_HOME"] = str(root_home())
+        env["CODEX_SQLITE_HOME"] = str(shared_sqlite_home())
+        env.pop("OPENAI_API_KEY", None)
+        check = subprocess.run([codex(), "login", "status"], env=env,
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if check.returncode:
+            raise CxaError("No working native-keyring login found under ~/.codex. "
+                           "Nothing was imported; your existing Codex login was not changed.")
+        home = setup_profile(name)
+        atomic_write(home / CANONICAL_MARKER, b'{"use_canonical_home": true}\n')
+        set_active(name)
+        print(f"Imported existing native-keyring account as '{name}' without reauthentication")
+
+
 def account_names() -> list[str]:
     parent = manager_home() / "accounts"
     if not parent.is_dir():
@@ -193,7 +251,7 @@ def get_active() -> str | None:
     return value
 
 
-def set_active(name: str) -> None:
+def set_active(name: str | None) -> None:
     atomic_write(manager_home() / "active.json", json.dumps({"active": name}).encode())
 
 
@@ -221,13 +279,15 @@ def codex() -> str:
 
 
 def environment(name: str) -> dict[str, str]:
-    home = profile_home(name)
-    if not home.is_dir() or home.is_symlink():
+    profile = profile_home(name)
+    if not profile.is_dir() or profile.is_symlink():
         raise CxaError(f"Unknown profile: {name}")
     validate_config()
-    link_shared(home)
+    link_shared(profile)
+    home = account_home(name)
     env = dict(os.environ)
-    # Managed profile prevents persistent file credential reuse across accounts.
+    # The canonical account retains its original keyring key, which Codex
+    # derives from CODEX_HOME. No OAuth token is read or copied by cam.
     env["CODEX_HOME"] = str(home)
     env["CODEX_SQLITE_HOME"] = str(shared_sqlite_home())
     # Avoid accidental API-key override of the stored ChatGPT account.
@@ -236,9 +296,10 @@ def environment(name: str) -> dict[str, str]:
 
 
 def ensure_no_plaintext(name: str) -> None:
-    path = profile_home(name) / "auth.json"
-    if os.path.lexists(path):
-        raise CxaError(f"FAIL CLOSED: unexpected plaintext auth.json: {path}; check managed Codex policy and remove it safely")
+    locations = (profile_home(name) / "auth.json", account_home(name) / "auth.json")
+    for path in locations:
+        if os.path.lexists(path):
+            raise CxaError(f"FAIL CLOSED: unexpected plaintext auth.json: {path}; check managed Codex policy and remove it safely")
 
 
 def login(name: str, device_auth: bool = False) -> None:
@@ -278,6 +339,56 @@ def switch(name: str) -> None:
         ensure_no_plaintext(name)
         set_active(name)
     print(f"Active account: {name}")
+
+
+def remove_account(name: str, *, forget_login: bool = False) -> None:
+    """Unregister an account while preserving profile data and shared Codex state.
+
+    Archiving rather than unlinking prevents accidental loss of user files that
+    Codex or its plugins may have placed inside a profile home. The original
+    ~/.codex is never touched for an imported account.
+    """
+    profile_home(name)  # Validate before filesystem operations.
+    with lock():
+        reject_running_codex()
+        if name not in account_names():
+            raise CxaError(f"Unknown account '{name}'")
+        if forget_login and is_canonical_profile(name):
+            raise CxaError("Refusing --forget-login for an imported account: that would log out "
+                           "the original ~/.codex login. Remove the registration without "
+                           "--forget-login, or use native 'codex logout' separately.")
+        ensure_no_plaintext(name)
+        home = profile_home(name)
+        if home.is_symlink() or not home.is_dir() or home.stat().st_uid != os.getuid():
+            raise CxaError(f"Unsafe account profile: {home}")
+        was_active = get_active() == name
+        # Logging out, if explicitly requested, happens BEFORE archiving so
+        # Codex can still locate its keyring identity using the old CODEX_HOME.
+        if forget_login:
+            result = subprocess.run([codex(), 'logout'], env=environment(name))
+            if result.returncode != 0:
+                raise CxaError("Codex logout failed; account registration was not removed")
+        retired_root = manager_home() / 'removed-accounts'
+        private_dir(retired_root)
+        retired = retired_root / f'{name}-{secrets.token_hex(8)}'
+        if os.path.lexists(retired):
+            raise CxaError(f'Refusing existing archived destination: {retired}')
+        # Same-filesystem rename: never follow profile-local shared symlinks.
+        os.rename(home, retired)
+        try:
+            if was_active:
+                set_active(None)
+        except Exception:
+            os.rename(retired, home)
+            raise
+        print(f"Removed account '{name}' from Codex Account Manager.")
+        print(f"Preserved its profile files at: {retired}")
+        if was_active:
+            print('No active account selected; use `cam switch NAME` or `cam add NAME`.')
+        if forget_login:
+            print('The managed Codex profile was logged out of its native keyring.')
+        else:
+            print('Existing OS-keyring credentials were not deleted or exported.')
 
 
 def newest_session(cwd: Path) -> str | None:
@@ -339,6 +450,8 @@ def doctor() -> None:
     print(f"Shared SQLite home: {shared_sqlite_home()}")
     print(f"Active profile: {get_active() or 'none'}")
     print(f"Accounts: {', '.join(account_names()) or 'none'}")
+    imported = [name for name in account_names() if is_canonical_profile(name)]
+    print(f"Imported native login: {', '.join(imported) if imported else 'none'}")
     leaks = [root_home() / "auth.json"] + [profile_home(n) / "auth.json" for n in account_names()]
     legacy_dir = Path.home() / ".local/share/cxa/profiles"
     if legacy_dir.exists():
@@ -469,7 +582,9 @@ def backup_zip(destination: Path, *, overwrite: bool = False, internal: bool = F
             roots.append(('sqlite', sqlite_root))
         manifest = {'schema': BACKUP_SCHEMA, 'created_utc': dt.datetime.now(dt.timezone.utc).isoformat(),
                     'roots': {name: str(path) for name, path in roots},
-                    'accounts': account_names(), 'files': {},
+                    'accounts': account_names(),
+                    'canonical_accounts': [n for n in account_names() if is_canonical_profile(n)],
+                    'files': {},
                     'note': 'No keyring credentials, auth.json, .env, key files, or transient data.'}
         seen = set()
         with zipfile.ZipFile(temporary, 'w', allowZip64=True) as archive:
@@ -601,6 +716,11 @@ def inspect_archive(archive: zipfile.ZipFile) -> dict:
     for name in accounts:
         if not isinstance(name, str) or not LABEL.fullmatch(name):
             raise CxaError('Invalid account name in manifest')
+    canonical = manifest.get('canonical_accounts', [])
+    if (not isinstance(canonical, list)
+            or any(not isinstance(name, str) or name not in accounts for name in canonical)
+            or len(canonical) != len(set(canonical)) or len(canonical) > 1):
+        raise CxaError('Invalid canonical account mapping in manifest')
     return manifest
 
 
@@ -730,6 +850,11 @@ def restore(archive_path: Path, *, dry_run: bool = False) -> None:
                         atomic_restore_file(staged, dest, executable)
                     for name in manifest['accounts']:
                         setup_profile(name)
+                        marker = profile_home(name) / CANONICAL_MARKER
+                        if name in manifest.get('canonical_accounts', []):
+                            atomic_write(marker, b'{"use_canonical_home": true}\n')
+                        elif marker.exists():
+                            marker.unlink()
                 except (OSError, CxaError) as exc:
                     raise CxaError(f'Restore stopped after partial changes: {exc}. '
                                    f'Original state was saved to {recovery}') from exc
@@ -746,9 +871,15 @@ def main(argv: list[str] | None = None) -> int:
         p = subs.add_parser(name)
         p.add_argument("name")
         p.add_argument("--device-auth", action="store_true")
+    p = subs.add_parser("import-current", help="Adopt the existing native-keyring login under ~/.codex")
+    p.add_argument("name")
     p = subs.add_parser("switch")
     p.add_argument("name")
     p.add_argument("--resume", action="store_true")
+    p = subs.add_parser("remove", help="Unregister an account without deleting shared sessions")
+    p.add_argument("name")
+    p.add_argument("--forget-login", action="store_true",
+                   help="Also run native Codex logout for a managed (not imported) profile")
     subs.add_parser("list")
     subs.add_parser("doctor")
     bp = subs.add_parser("backup", help="Back up Codex state to ZIP (credentials excluded)")
@@ -771,12 +902,16 @@ def main(argv: list[str] | None = None) -> int:
                 initialize()
         elif args.action == "add":
             login(args.name, args.device_auth)
+        elif args.action == "import-current":
+            import_current(args.name)
         elif args.action == "relogin":
             relogin(args.name, args.device_auth)
         elif args.action == "switch":
             switch(args.name)
             if args.resume:
                 return run("resume", [])
+        elif args.action == "remove":
+            remove_account(args.name, forget_login=args.forget_login)
         elif args.action == "list":
             print("\n".join(("* " if n == get_active() else "  ") + n for n in account_names()))
         elif args.action == "doctor":
